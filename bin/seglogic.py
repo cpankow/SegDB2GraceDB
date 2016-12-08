@@ -210,6 +210,7 @@ if not opts.graceid:
     if alert['alert_type'] != 'new':
         if opts.verbose:
             print "alert_type!=new, ignoring..."
+        sys.exit(0)
     opts.graceid = alert['uid']
 
 #------------------------
