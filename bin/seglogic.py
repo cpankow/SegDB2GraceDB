@@ -21,7 +21,7 @@ from glue.ligolw import table
 from glue.ligolw import lsctables
 from glue.ligolw import utils as ligolw_utils
 
-from glue.segments import segment, segmentlist
+from glue.segments import segment, segmentlist, segmentlistdict
 
 from dqsegdb.apicalls import dqsegdbQueryTimes
 
@@ -264,6 +264,7 @@ if not opts.skip_gracedb_upload:
 flags = config.get( 'general', 'flags' ).split()
 flags.sort( key=lambda l: config.getfloat(l,'wait')+config.getfloat(l,'look_right') ) ### sort by how soon we can launch query
 
+plot_known, plot_active = segmentlistdict(), segmentlistdict()
 for flag in flags:
     if opts.verbose:
         print "    %s"%flag
@@ -307,6 +308,7 @@ for flag in flags:
             # We can probably reuse this
             xmlfiles = findDMTXML(dmt_path, start, start + dur, ifo)
             known, active = retrieveSegmentsFromXML(xmlfiles, name)
+        plot_known[flag], plot_active[flag] = known, active
 
     ### something went wrong with the query!
     except Exception as e:
@@ -343,6 +345,9 @@ for flag in flags:
 
         ### apply labels
         writeLabel( gracedb, opts.graceid, set(labels) )
+
+from plot import plot_seglist
+plot_seglist(plot_known, plot_active, gpstime)
 
 #---------------------------------------------------------------------------------------------------
 
