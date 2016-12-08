@@ -125,6 +125,8 @@ def writeLogMessage(ssum, seg, gpstime, actvLabels=None, inactvLabels=None, flag
             message += " <strong>Will label as : %s.</strong>"%(", ".join(unflagLabels))
             labels += unflagLabels
 
+    return message
+
 def retrieveFromDQSegDB(flag, segdb_url, include="known,active"):
     ifo, name, ver = flag.split(":")
 
