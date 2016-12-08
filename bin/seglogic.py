@@ -14,11 +14,16 @@ from collections import defaultdict
 
 import time
 from lal import gpstime as lal_gpstime
+from lal import LIGOTimeGPS
 
 from glue.ligolw import ligolw
 from glue.ligolw import table
 from glue.ligolw import lsctables
 from glue.ligolw import utils as ligolw_utils
+
+from glue.segments import segment, segmentlist
+
+from dqsegdb.apicalls import dqsegdbQueryTimes
 
 from ligo.gracedb.rest import GraceDb
 
@@ -34,7 +39,7 @@ def flag2filename( flag, start, dur, output_dir="." ):
     flag = "%s-%s"%(flag[0], "_".join(f.replace("-","_") for f in flag[1:]))
     return "%s/%s-%d-%d.xml.gz"%(output_dir, flag, start, dur)
 
-def segDBcmd( url, flag, start, end, outfilename, dmt=False ):
+def _segDBcmd( url, flag, start, end, outfilename, dmt=False ):
     ### ligolw_segment_query_dqsegdb -t https://segments.ligo.org -q -a H1:DMT-ANALYSIS_READY:1 -s 1130950800 -e 1131559200
     if dmt:
         return "ligolw_segment_query --dmt-files -q -a %s -s %d -e %d -o %s"%(flag, start, end, outfilename)
@@ -79,6 +84,108 @@ def writeLabel( gdb, graceid, labels ):
 
 #-------------------------------------------------
 
+def writeLogMessage(ssum, seg, gpstime, actvLabels=None, inactvLabels=None, flagLabels=None, unflagLabels=None):
+
+    ### write message as we process segments
+    message = "%s" % flag
+
+    ### define the fraction of the time this flag is defined
+    ### get list of defined times
+    # FIXME: dur (segmentlist)
+    defd = sum(map(abs, ssum))
+    message += "<br>&nbsp;&nbsp;defined : %.3f/%d=%.3f%s"%(defd, dur, defd/dur * 100, "%")
+
+    actv = sum(map(abs, seg))
+    flagged = sum([1 if gpstime in s else 0 for s in seg])
+
+    ### define the fraction of the time this flag is active?
+    # get list of  segments
+    labels = [] ### labels to be applied
+
+    message += "<br>&nbsp;&nbsp;active : %.3f/%d=%.3f%s"%(actv, dur, actv/dur * 100, "%")
+
+    if actv:
+        if actvLabels:
+            message += " <strong>Will label as : %s.</strong>"%(", ".join(actvLabels))
+            labels += actvLabels
+    else:
+        if inactvLabels:
+            message += " <strong>Will label as : %s.</strong>"%(", ".join(inactvLabels))
+            labels += inactvLabels
+
+    if flagged:
+        message += "<br>&nbsp;&nbsp;<strong>candidate is within these segments!</strong>"
+        if flagLabels:
+            message += " <strong>Will label as : %s.</strong>"%(", ".join(flagLabels))
+            labels += flagLabels
+
+    else:
+        message += "<br>&nbsp;&nbsp;<strong>candidate is not within these segments!</strong>"
+        if unflagLabels:
+            message += " <strong>Will label as : %s.</strong>"%(", ".join(unflagLabels))
+            labels += unflagLabels
+
+def retrieveFromDQSegDB(flag, segdb_url, include="known,active"):
+    ifo, name, ver = flag.split(":")
+
+    _, url = segdb_url.split("://")
+
+    resp = dqsegdbQueryTimes(protocol="https", server=url, ifo=ifo, \
+        name=name, version=int(ver), include_list_string=include, \
+        startTime=start, endTime=start+dur)
+    resp = resp[0]
+    known = map(segment, [map(LIGOTimeGPS, s) for s in resp["known"]])
+    known = segmentlist(known)
+    active = map(segment, [map(LIGOTimeGPS, s) for s in resp["active"]])
+    active = segmentlist(active)
+
+    return known, active
+
+
+def findDMTXML(basepath, gps_start, gps_end, ifo, filestem="DQ_Segments"):
+    gps_search = [str(gps_start)[:5]]
+    if str(gps_end)[:5] != str(gps_end)[:5]:
+        gps_search.append(str(gps_end)[:5])
+
+    include = segment(gps_start, gps_end)
+
+    xmlfiles = []
+    for search in gps_search:
+        search_path = os.path.join(basepath.replace("file://", ""), \
+            "%s-%s-%s" % (ifo[0], filestem, search))
+        for path in glob.glob(search_path + "/*.xml"):
+            _, _, st, d = os.path.basename(path)[:-4].split("-")
+            seg = segment(int(st), int(st) + int(d))
+            if not seg.intersects(include):
+                continue
+            xmlfiles.append(path)
+
+    return xmlfiles
+
+# FIXME: necessary since DMT XML do not have ns columns
+def _segment(segrow):
+    return segment(segrow.start_time, segrow.end_time)
+            
+def retrieveSegmentsFromXML(xmlfiles, name):
+    seg_all, ssum_all = [], []
+    for path in xmlfiles:
+        xmldoc = ligolw_utils.load_filename(path, contenthandler=lsctables.use_in(ligolw.LIGOLWContentHandler))
+ 
+        sdef = lsctables.SegmentDefTable.get_table(xmldoc)
+        ssum = lsctables.SegmentSumTable.get_table(xmldoc)
+        seg = lsctables.SegmentTable.get_table(xmldoc)
+
+        sdef = filter(lambda d: d.name == name, sdef)[0].segment_def_id
+        ssum_all.extend(filter(lambda s: s.segment_def_id == sdef, ssum))
+        seg_all.extend(filter(lambda s: s.segment_def_id == sdef, seg))
+
+    ssum_all = segmentlist(map(_segment, ssum_all))
+    ssum_all.coalesce()
+    seg_all = segmentlist(map(_segment, seg_all))
+    seg_all.coalesce()
+
+    return ssum_all, seg_all
+
 parser = OptionParser(usage=usage, description=description)
 
 parser.add_option("-v", "--verbose", default=False, action="store_true")
@@ -103,7 +210,6 @@ if not opts.graceid:
     if alert['alert_type'] != 'new':
         if opts.verbose:
             print "alert_type!=new, ignoring..."
-        sys.exit(0)
     opts.graceid = alert['uid']
 
 #------------------------
@@ -176,6 +282,9 @@ for flag in flags:
     dmt = config.has_option(flag, 'dmt')
     if dmt:
         os.environ['ONLINEDQ'] = config.get(flag, 'dmt')
+        dmt_path = config.get(flag, 'dmt')
+    else:
+        dmt_path = None
 
     ### wait until data becomes available
     wait = end + config.getfloat(flag, 'wait') - lal_gpstime.gps_time_now()
@@ -186,16 +295,21 @@ for flag in flags:
 
     ### actually perform the query
     outfilename = flag2filename( flag, start, dur, output_dir)
-    cmd = segDBcmd( segdb_url, flag, start, end, outfilename, dmt=dmt )
-    if opts.verbose:
-        print "        %s"%cmd
-    proc = sp.Popen( cmd.split(), stdout=sp.PIPE, stderr=sp.PIPE )
-    output = proc.communicate()
 
-    ### check returncode for errors
-    if proc.returncode: ### something went wrong with the query!
+    ifo, name, ver = flag.split(":")
+    try:
+        if not dmt:
+            known, active = retrieveFromDQSegDB(flag, segdb_url)
+        else:
+            # We can probably reuse this
+            xmlfiles = findDMTXML(dmt_path, start, start + dur, ifo)
+            known, active = retrieveSegmentsFromXML(xmlfiles, name)
+
+    ### something went wrong with the query!
+    except Exception as e:
         if opts.verbose:
-            print "\tWARNING: an error occured while querying for this flag!\n%s"%output[1]
+            print "\tWARNING: an error occured while querying for this flag!"
+            print e
 
         if not opts.skip_gracedb_upload:
             message = "%s<br>&nbsp;&nbsp;<strong>WARNING</strong>: an error occured while querying for this flag!"%flag
@@ -217,60 +331,7 @@ for flag in flags:
             print "        %s"%message
         writeLog( gracedb, opts.graceid, message=message, filename=outfilename, tagname=qtags )
 
-        ### process segments into summary statements
-        xmldoc = ligolw_utils.load_filename(outfilename, contenthandler=lsctables.use_in(ligolw.LIGOLWContentHandler))
-
-        sdef = table.get_table(xmldoc, lsctables.SegmentDefTable.tableName)
-        ssum = table.get_table(xmldoc, lsctables.SegmentSumTable.tableName)
-        seg = table.get_table(xmldoc, lsctables.SegmentTable.tableName)
-
-        ### get segdef_id
-#        segdef_id = next(a.segment_def_id for a in sdef if a.name==flag.split(":")[1])
-        segdef_id = next(a.segment_def_id for a in sdef if a.name=='RESULT')
-
-        ### write message as we process segments
-        message = "%s"%flag
-
-        ### define the fraction of the time this flag is defined
-        ### get list of defined times
-        defd = 0.0
-        for a in ssum:
-            if a.segment_def_id==segdef_id:
-                defd += a.end_time+1e-9*a.end_time_ns - a.start_time+1e-9*a.start_time_ns        
-        message += "<br>&nbsp;&nbsp;defined : %.3f/%d=%.3f%s"%(defd, dur, defd/dur * 100, "%")
-
-        ### define the fraction of the time this flag is active?
-        # get list of  segments
-        actv = 0.0
-        flagged = 0
-        labels = [] ### labels to be applied
-        for a in seg:
-            if a.segment_def_id==segdef_id:
-                actv += a.end_time+1e-9*a.end_time_ns - a.start_time+1e-9*a.start_time_ns
-                if (a.end_time+1e-9*a.end_time_ns >= gpstime) and (gpstime >= a.start_time+1e-9*a.start_time_ns):
-                    flagged += 1
-
-        message += "<br>&nbsp;&nbsp;active : %.3f/%d=%.3f%s"%(actv, dur, actv/dur * 100, "%")
-        if actv:
-            if actvLabels:
-                message += " <strong>Will label as : %s.</strong>"%(", ".join(actvLabels))
-                labels += actvLabels
-        else:
-            if inactvLabels:
-                message += " <strong>Will label as : %s.</strong>"%(", ".join(inactvLabels))
-                labels += inactvLabels
-
-        if flagged:
-            message += "<br>&nbsp;&nbsp;<strong>candidate is within these segments!</strong>"
-            if flagLabels:
-                message += " <strong>Will label as : %s.</strong>"%(", ".join(flagLabels))
-                labels += flagLabels
-            
-        else:
-            message += "<br>&nbsp;&nbsp;<strong>candidate is not within these segments!</strong>"
-            if unflagLabels:
-                message += " <strong>Will label as : %s.</strong>"%(", ".join(unflagLabels))
-                labels += unflagLabels
+        message = writeMessage(known, active)
 
         ### post message
         if opts.verbose:
